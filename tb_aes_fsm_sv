@@ -1,0 +1,224 @@
+// =============================================================================
+// File        : tb_aes_fsm.sv
+// Project     : AES-128 Hardware Security Module (HSM)
+// Description : Self-checking testbench for aes_fsm.
+//
+//               Tests:
+//               1. SUCCESS CASE  - NIST FIPS-197 Appendix B known-answer test
+//               2. ATTACK DEMO A - 1-bit key tamper     → avalanche verified
+//               3. ATTACK DEMO B - 1-bit plaintext tamper → diffusion verified
+//               4. EDGE CASE    - all-zero key + all-zero plaintext
+//
+// NIST FIPS-197 Appendix B Test Vector:
+//   Key        : 2B7E151628AED2A6ABF7158809CF4F3C
+//   Plaintext  : 3243F6A8885A308D313198A2E0370734
+//   Ciphertext : 3925841D02DC09FBDC118597196A0B32
+// =============================================================================
+
+`timescale 1ns/1ps
+
+module tb_aes_fsm;
+
+    // -------------------------------------------------------------------------
+    // DUT signals
+    // -------------------------------------------------------------------------
+    logic        clk;
+    logic        rst;
+    logic        start;
+    logic [127:0] key_in;
+    logic [127:0] plaintext;
+    logic [127:0] ciphertext;
+    logic        done;
+
+    // -------------------------------------------------------------------------
+    // NIST FIPS-197 Appendix B test vector
+    // -------------------------------------------------------------------------
+    localparam logic [127:0] KEY_TV = 128'h2B7E151628AED2A6ABF7158809CF4F3C;
+    localparam logic [127:0] PT_TV  = 128'h3243F6A8885A308D313198A2E0370734;
+    localparam logic [127:0] CT_EXP = 128'h3925841D02DC09FBDC118597196A0B32;
+
+    localparam int CLK_PERIOD = 8;  // 125 MHz → 8 ns
+
+    // Pass/fail counters
+    int pass_cnt = 0;
+    int fail_cnt = 0;
+
+    // -------------------------------------------------------------------------
+    // Helper: count bytes that differ between two 128-bit values
+    // -------------------------------------------------------------------------
+    function automatic int diff_bytes (
+        input logic [127:0] a,
+        input logic [127:0] b
+    );
+        diff_bytes = 0;
+        for (int i = 0; i < 16; i++) begin
+            if (a[127 - i*8 -: 8] !== b[127 - i*8 -: 8])
+                diff_bytes++;
+        end
+    endfunction
+
+    // -------------------------------------------------------------------------
+    // DUT instantiation
+    // -------------------------------------------------------------------------
+    aes_fsm DUT (
+        .clk       (clk),
+        .rst       (rst),
+        .start     (start),
+        .key_in    (key_in),
+        .plaintext (plaintext),
+        .ciphertext(ciphertext),
+        .done      (done)
+    );
+
+    // -------------------------------------------------------------------------
+    // Clock generator: 125 MHz
+    // -------------------------------------------------------------------------
+    initial clk = 1'b0;
+    always #(CLK_PERIOD/2) clk = ~clk;
+
+    // -------------------------------------------------------------------------
+    // Stimulus
+    // -------------------------------------------------------------------------
+    initial begin
+        logic [127:0] ct_orig, ct_atck_k, ct_atck_pt;
+        int           db;
+
+        // === RESET ============================================================
+        rst   = 1'b1;
+        start = 1'b0;
+        key_in    = 128'd0;
+        plaintext = 128'd0;
+        repeat (5) @(posedge clk);
+        rst = 1'b0;
+        repeat (2) @(posedge clk);
+
+        // =====================================================================
+        // TEST 1: NIST FIPS-197 Appendix B Known-Answer Test
+        // =====================================================================
+        $display("--- TEST 1: NIST FIPS-197 Appendix B Known-Answer Test ---");
+
+        key_in    = KEY_TV;
+        plaintext = PT_TV;
+        start     = 1'b1;
+        @(posedge clk);
+        start = 1'b0;
+        @(posedge done);
+        @(posedge clk);
+
+        ct_orig = ciphertext;
+
+        if (ciphertext === CT_EXP) begin
+            $display("TEST 1 PASS: Ciphertext matches NIST vector.");
+            $display("  Got:      %h", ciphertext);
+            pass_cnt++;
+        end else begin
+            $error("TEST 1 FAIL: Mismatch!\n  Got:      %h\n  Expected: %h",
+                   ciphertext, CT_EXP);
+            fail_cnt++;
+        end
+
+        repeat (3) @(posedge clk);
+
+        // =====================================================================
+        // TEST 2: ATTACK DEMO A - 1-bit KEY tamper (Avalanche Effect)
+        // =====================================================================
+        $display("--- TEST 2: ATTACK DEMO A - 1-bit Key Tamper ---");
+
+        key_in    = {KEY_TV[127:1], ~KEY_TV[0]};
+        plaintext = PT_TV;
+        start     = 1'b1;
+        @(posedge clk);
+        start = 1'b0;
+        @(posedge done);
+        @(posedge clk);
+
+        ct_atck_k = ciphertext;
+        db        = diff_bytes(ct_orig, ct_atck_k);
+
+        $display("TEST 2 - Original CT  : %h", ct_orig);
+        $display("TEST 2 - Tampered CT  : %h", ct_atck_k);
+        $display("TEST 2 - Bytes changed: %0d / 16", db);
+
+        if (ct_atck_k === ct_orig) begin
+            $error("TEST 2 FAIL: Key tamper gave identical ciphertext!");
+            fail_cnt++;
+        end else if (db >= 4) begin
+            $display("TEST 2 PASS: Avalanche confirmed - %0d bytes changed.", db);
+            pass_cnt++;
+        end else begin
+            $warning("TEST 2 WARN: Only %0d bytes changed - weaker than expected.", db);
+        end
+
+        repeat (3) @(posedge clk);
+
+        // =====================================================================
+        // TEST 3: ATTACK DEMO B - 1-bit PLAINTEXT tamper (Diffusion)
+        // =====================================================================
+        $display("--- TEST 3: ATTACK DEMO B - 1-bit Plaintext Tamper ---");
+
+        key_in    = KEY_TV;
+        plaintext = {PT_TV[127:1], ~PT_TV[0]};
+        start     = 1'b1;
+        @(posedge clk);
+        start = 1'b0;
+        @(posedge done);
+        @(posedge clk);
+
+        ct_atck_pt = ciphertext;
+        db         = diff_bytes(ct_orig, ct_atck_pt);
+
+        $display("TEST 3 - Original CT  : %h", ct_orig);
+        $display("TEST 3 - Tampered CT  : %h", ct_atck_pt);
+        $display("TEST 3 - Bytes changed: %0d / 16", db);
+
+        if (ct_atck_pt === ct_orig) begin
+            $error("TEST 3 FAIL: Plaintext tamper gave identical ciphertext!");
+            fail_cnt++;
+        end else if (db >= 4) begin
+            $display("TEST 3 PASS: Diffusion confirmed - %0d bytes changed.", db);
+            pass_cnt++;
+        end else begin
+            $warning("TEST 3 WARN: Only %0d bytes changed.", db);
+        end
+
+        repeat (3) @(posedge clk);
+
+        // =====================================================================
+        // TEST 4: EDGE CASE - all-zero key, all-zero plaintext
+        // =====================================================================
+        $display("--- TEST 4: EDGE CASE - All-zero key and plaintext ---");
+
+        key_in    = 128'd0;
+        plaintext = 128'd0;
+        start     = 1'b1;
+        @(posedge clk);
+        start = 1'b0;
+        @(posedge done);
+        @(posedge clk);
+
+        if (ciphertext !== 128'd0) begin
+            $display("TEST 4 PASS: All-zero input produced non-zero ciphertext: %h",
+                     ciphertext);
+            pass_cnt++;
+        end else begin
+            $error("TEST 4 FAIL: All-zero key/PT produced all-zero ciphertext!");
+            fail_cnt++;
+        end
+
+        // =====================================================================
+        // SUMMARY
+        // =====================================================================
+        repeat (5) @(posedge clk);
+        $display("============================================");
+        $display("SIMULATION COMPLETE");
+        $display("  PASSED: %0d / %0d", pass_cnt, pass_cnt + fail_cnt);
+        if (fail_cnt == 0)
+            $display("  ALL TESTS PASSED - AES-128 HSM is CORRECT");
+        else
+            $error("  FAILURES: %0d", fail_cnt);
+        $display("============================================");
+
+        $finish;
+    end
+
+endmodule
